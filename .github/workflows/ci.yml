@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -97,3 +98,80 @@ jobs:
           make -j"$(nproc)"
           make check VERBOSE=1
           ./src/ios_webkit_debug_proxy -V
+
+      - name: Install Windows executable
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          make -C src install-exec bindir="$PWD/dist"
+          test -f dist/ios_webkit_debug_proxy.exe
+
+      - name: Bundle runtime dependencies
+        run: |
+          set -euo pipefail
+
+          system32="$(cygpath -u "${SYSTEMROOT:-${SystemRoot:-C:/Windows}}")/System32"
+
+          collect_deps() {
+            local file="$1"
+            local deps dll source
+
+            echo "Scanning: $file"
+
+            deps=$(objdump -p "$file" | tr -d '\r' | awk '/DLL Name:/ {print $3}')
+
+            while IFS= read -r dll; do
+              [[ -n "$dll" ]] || continue
+
+              dll="${dll,,}"
+              source="$MINGW_PREFIX/bin/$dll"
+
+              if [[ -f "dist/$dll" ]]; then
+                continue
+              elif [[ -f "$source" ]]; then
+                echo "Bundling: $dll"
+                cp "$source" "dist/$dll"
+                collect_deps "dist/$dll"
+              elif [[ "$dll" == api-ms-win-* ||
+                      "$dll" == ext-ms-* ||
+                      -f "$system32/$dll" ]]; then
+                echo "System DLL: $dll"
+              else
+                echo "::error::Unresolved dependency: $dll (required by $file)"
+                return 1
+              fi
+            done <<< "$deps"
+          }
+
+          collect_deps dist/ios_webkit_debug_proxy.exe
+
+          ls -lh dist/
+
+      - name: Test portable Windows binary
+        shell: pwsh
+        run: |
+          $env:Path = "$env:SystemRoot\System32;$env:SystemRoot"
+          Set-Location dist
+
+          $process = Start-Process `
+            -FilePath ".\ios_webkit_debug_proxy.exe" `
+            -ArgumentList "-V" `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+
+          $code = $process.ExitCode
+
+          Write-Host "Exit code: $code (0x$('{0:X8}' -f $code))"
+
+          if ($code -ne 0) {
+            throw "Portable binary test failed: $code"
+          }
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-webkit-debug-proxy-win64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
